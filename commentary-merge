@@ -1,0 +1,926 @@
+#!/usr/bin/perl
+use 5.36.0;
+use strict;
+use English '-no_match_vars';
+use POSIX qw(mkfifo _exit :signal_h :errno_h :sys_wait_h);
+use Config::General;
+use Data::Dumper;
+use Getopt::Long;
+use Time::HiRes qw(time sleep);
+
+my $AVCONV = "/usr/local/ffmpeg/bin/ffmpeg";
+my $SOX    = "/usr/bin/sox";
+my $AVPROBE = '/usr/local/ffmpeg/bin/ffprobe';
+my $ATOMICPARSLEY = '/usr/bin/AtomicParsley';
+
+my $verbose      = 0;
+my $very_verbose      = 0;
+my $child_process_timeout = 5;
+
+# make sure required programs are present
+foreach ($AVCONV, $SOX, $AVPROBE, $ATOMICPARSLEY) {
+	if (! -x) {
+		die "required program $_ not found";
+	}
+}
+
+GetOptions (
+	'verbose|v'   => \$verbose,
+	'veryverbose|vv'   => \$very_verbose,
+	'timeout|t=i'   => \$child_process_timeout,
+);
+if ($very_verbose) {
+	$verbose = 1;
+}
+
+if (!$ARGV[0]) {
+	die "configuration file required on command line";
+}
+if (! -r $ARGV[0]) {
+	die "configuration file $ARGV[0] not found";
+}
+my $config = Config::General->new($ARGV[0]);
+my %config_hash = $config->getall();
+if ($very_verbose) {
+	say Dumper(\%config_hash);
+}
+
+sub trim($s) { $s =~ s/^\s+|\s+$//g; return $s };
+
+sub get_config_param2( $hash_ref, $key1, $key2, $default_value = '') {
+    my $value = $default_value;
+    if (exists($hash_ref->{$key1}{$key2}) && defined($hash_ref->{$key1}{$key2})) {
+    	$value = trim($hash_ref->{$key1}{$key2});
+    }
+    return $value;
+}
+
+sub parse_volume_adjustment {
+    my ($value, $default) = @_;
+
+    $value = $default unless defined $value and length $value;
+
+    return $value / 100.0 if $value =~ /^(\d+(?:\.\d+)?)%$/;
+    return $value         if $value =~ /^\d+(?:\.\d+)?$/;
+
+    die "Invalid volume adjustment '$value'";
+}
+
+my $OUTPUT_MOVIE_FILE = &get_config_param2(\%config_hash, 'output', 'file');
+if (! length $OUTPUT_MOVIE_FILE) {
+	die 'No output file sepcified';
+}
+my $INPUT_MOVIE_FILE = $config_hash{'movie'}{'file'};
+if (! -r $INPUT_MOVIE_FILE) {
+	  die "Can't read input movie file: $INPUT_MOVIE_FILE";
+}
+my $INPUT_MOVIE_OFFSET = get_config_param2(\%config_hash, 'movie', 'offset', '');
+if ($INPUT_MOVIE_OFFSET eq '0') {
+	$INPUT_MOVIE_OFFSET = '';
+}
+say "INPUT_MOVIE_OFFSET = $INPUT_MOVIE_OFFSET" if $verbose;
+my $COMMENTARY_FILE = $config_hash{'commentary'}{'file'};
+my $COMMENTARY_OFFSET = &get_config_param2(\%config_hash, 'commentary', 'offset', '');
+my $COMMENTARY_PADDING = '';
+if ($COMMENTARY_OFFSET eq '' || $COMMENTARY_OFFSET eq '0') {
+	$COMMENTARY_OFFSET = '';
+    $COMMENTARY_PADDING = &get_config_param2(\%config_hash, 'commentary', 'pad', '');
+    say "COMMENTARY_PADDING = $COMMENTARY_PADDING" if $verbose;
+}
+else {
+    say "COMMENTARY_OFFSET = $COMMENTARY_OFFSET" if $verbose;
+}
+my $COMMENTARY_VOLUME_ADJUSTMENT = parse_volume_adjustment(get_config_param2(\%config_hash, 'commentary', 'volumeadjustment'), 1.0);
+
+my $MOVIE_VOLUME_ADJUSTMENT = parse_volume_adjustment(get_config_param2(\%config_hash, 'movie', 'volumeadjustment'), 1.0);
+
+my $CONFIG_MOVIE_AUDIO_STREAM = &get_config_param2(\%config_hash, 'movie', 'audio_stream', -1);
+say "COMMENTARY_VOLUME_ADJUSTMENT = $COMMENTARY_VOLUME_ADJUSTMENT" if $verbose;
+say "MOVIE_VOLUME_ADJUSTMENT = $MOVIE_VOLUME_ADJUSTMENT" if $verbose;
+
+my $metadata = get_config_param2(\%config_hash, 'output', 'metadata', undef);
+#say 'metadata = ', Dumper($metadata) if $very_verbose;
+my $artwork_file = undef;
+if (defined($metadata) && exists($metadata->{artwork}) && defined($metadata->{artwork}) && $metadata->{artwork} ne '') {
+	$artwork_file = $metadata->{artwork};
+	if (! -r $artwork_file) {
+		die "metatdata artwork file $artwork_file not found";
+	}
+}
+my $ducking = 1;
+
+
+my %children;
+my @producers;
+my $shutting_down = 0;
+my @tempfiles;
+my $starttime = time();
+my $tmpdir = undef;
+
+say "starting up: pid $$" if $verbose;
+
+my $copy_subtitles =  &get_config_param2(\%config_hash, 'output', 'copy-subtitles', 1);
+if ($copy_subtitles eq '0' || $copy_subtitles eq 'false') {
+	$copy_subtitles = 0;
+}
+else {
+	$copy_subtitles = 1;
+}
+
+#region Process management
+sub waitpid_timeout( $pid, $timeout ) {
+	my $alarm_exception = "waitpid timeout\n";
+	my $ret             = -1;
+	eval {
+		local $SIG{ALRM} = sub { die $alarm_exception };
+		alarm $timeout;
+		$ret = waitpid( $pid, 0 );
+		die "waitpid($pid) failed: $!"
+            if $ret == -1;
+	};
+	my $exception = $@;
+	alarm 0;
+	if ($exception eq $alarm_exception) {
+		say "waitpid_timeout: timeout after $timeout seconds"
+            if $verbose;
+
+        return -1;
+	}
+	return $ret;
+}
+
+sub wait_for_stage( $stage, $signal, $timeout ) {
+
+	my @target_pids = grep {
+        $children{$_}{stage} == $stage
+    } keys %children;
+	
+	if (!@target_pids) {
+		return;
+	}
+	say ("stage $stage: sending ", $signal, " to PIDs: ", join(' ', @target_pids)) if $verbose;
+	kill $signal, @target_pids;
+	
+	my $blocking = $signal eq 'KILL' || !$timeout;
+    my $deadline = $blocking ? undef : time() + $timeout;
+    my %pending = map { $_ => 1 } @target_pids;
+
+    while (%pending) {
+        while (%pending) {
+			# reap any child, including ones we're not specifically signalling here
+            my $pid = $blocking ? waitpid( -1, 0 ) : waitpid( -1, WNOHANG );
+
+            last if $pid == 0;  # only applies to non-blocking
+
+            if ( $pid == -1 ) {
+                die "waitpid failed: $!"
+                    unless $!{ECHILD};
+
+				# oops, things have gotten out of sync
+				warn "waitpid reported no remaining children; clearing stale PID records"
+    	    		if $verbose && (%children || %pending);
+
+				%children = ();
+    			return;				
+            }
+
+			if ($verbose) {
+				my $status = $?;
+
+				if ( WIFEXITED($status) ) {
+					$status = WEXITSTATUS($status);
+					if ($status == 255) {
+						warn "child process $pid exited after shutdown (likely broken pipe)" if $verbose;
+    				}
+    				else {
+						say "child process $pid exited with status $status" if $verbose;
+					}					
+				}
+				elsif ( WIFSIGNALED($status) ) {
+					$status = WTERMSIG($status);
+					say "child process $pid killed by signal ", $status if $verbose;
+				}
+				else {
+					say "child process ended by some other means: $status" if $verbose;
+				}
+			}
+
+			# remove child process tracking data
+            delete $children{$pid};
+            delete $pending{$pid};
+        }
+
+		last if $blocking;
+
+		last if time() >= $deadline;
+
+		sleep 0.05;
+    }
+
+    return keys %pending;
+}
+
+sub secure_exec {
+    my $options = ref($_[0]) eq 'HASH' ? shift : {};
+	my $cmd     = shift;
+
+	# reset signal handlers
+	$SIG{TERM} = $SIG{INT} = 'DEFAULT';
+
+	if (defined $options->{stdin}) {
+		open( STDIN, '<', $options->{stdin} ) or die "Could not set stdin to {$options->{stdin}}: $!";
+	}
+	if (defined $options->{stdout}) {
+		open( STDOUT, '>', $options->{stdout} ) or die "Could not redirect stdout to file {$options->{stdout}}: $!";
+	}
+	if (defined $options->{stderr}) {
+		if ($options->{stderr} eq 'stdout') {
+			open( STDERR, '>&', \*STDOUT ) or die "Could not set stdin to {$options->{stderr}}: $!";
+		}
+		else {
+			open( STDERR, '>', $options->{stderr} ) or die "Could not redirect stderr to file {$options->{stderr}}: $!";
+		}
+	}
+	my $real_uid = $UID;
+	my $real_gid = $GID;
+
+	$EGID = $real_gid;
+	$GID  = $real_gid;
+
+	$EUID = $real_uid;
+	$UID  = $real_uid;
+
+	die "Can't drop privileges to exec command $cmd->[0]"
+    	unless $UID == $EUID && $GID eq $EGID;	
+
+	$ENV{PATH} = "/bin:/usr/bin";    # Minimal PATH.
+	# Consider sanitizing the environment even more.
+
+	# suppress color in ffmpeg output
+	$ENV{'AV_LOG_FORCE_NOCOLOR'} = 'yes';
+
+	exec { $cmd->[0] } @$cmd or warn "can't exec $$cmd[0]: $!";
+	_exit(5);  # don't run an END block, etc
+}
+
+sub secure_system {
+    my $options = ref($_[0]) eq 'HASH' ? shift : {};
+    my @command = @_;
+	
+	my $pid = fork();
+	die "cannot fork to execute command $command[0]: $!" unless defined($pid);
+	if ($pid) {
+		# parent
+
+		# track child in case of process interruption
+		my $full_command = join(' ', @command);
+		say 'spawned PID [', $pid, '] ', $full_command if $very_verbose;
+		$children{$pid} = {
+			command => $full_command,  # for debugging
+			stage => $options->{stage} // 0,
+			description => $options->{description} // '',
+		};
+
+		my $ret;
+
+		# wait for process to finish
+		# TODO apply timeout for warning
+		while (1) {
+            $ret = waitpid($pid, 0);
+
+            last if $ret == $pid;
+            next if $ret == -1 && $!{EINTR};
+
+            delete $children{$pid};
+
+            die "waitpid failed for PID $pid: $!"
+                unless $ret == -1 && $!{ECHILD};
+
+            return;
+        }
+
+		my $status = $?;
+        delete $children{$pid};
+
+        return $status;
+	}
+	else {
+		secure_exec( $options, \@command );
+	}	
+}
+
+sub backticks {
+	local (*KID);
+
+	my $pid = open( KID, "-|" );
+	die "Can't fork to execute command $_[0]: $!" unless defined( $pid );
+	if ($pid) { 
+		# parent
+		my @chunks = <KID>;
+		close KID;
+		my $exitstatus = 0;
+		if ($?) {
+			if ( WIFEXITED($?) ) {
+				$exitstatus = WEXITSTATUS($?);
+				say "exit status = $exitstatus" if $verbose;
+			}
+			elsif ( WIFSIGNALED($?) ) {
+				$exitstatus = WTERMSIG($?);
+				say "exitted with signal status = $exitstatus" if $verbose;
+			}
+			else {
+				say "exit status = $?" if $verbose;
+			}
+		}
+
+		my $ret   = '';
+		my $count = scalar(@chunks);
+		if ( $count > 0 ) {
+			chomp $chunks[ $count - 1 ];    # remove final newline if present
+			$ret = join( '', @chunks );
+		}
+		$? = $exitstatus;
+		return $ret;
+	}
+	else {
+		secure_exec({ stdin => '/dev/null' }, \@_);
+	}
+}
+
+sub background {
+    my $options = ref($_[0]) eq 'HASH' ? shift : {};
+    my @command = @_;
+
+	my $pid = fork();
+	die "cannot fork to execute command $command[0]: $!" unless defined($pid);
+	if ($pid) {
+		my $full_command = join(' ', @command);
+		say 'spawned PID [', $pid, '] ', $full_command if $very_verbose;
+		$children{$pid} = {
+			command => $full_command,  # for debugging
+			stage => $options->{stage} // 0,
+			description => $options->{description} // '',
+		};
+
+		# parent
+		return $pid;
+	}
+	else {
+		secure_exec( $options, \@command );
+	}
+}
+#endregion
+
+#region Other resource management
+sub cleanup_temp_files {
+	while (@tempfiles) {
+	    my $filename = $tempfiles[-1];
+		say 'removing temp file [', $filename, ']' if $verbose;
+		if (-e $filename && !unlink($filename)) {
+			warn "cannot remove temp file [$filename]: $!";
+		}
+		pop(@tempfiles);
+	}
+	if ($tmpdir && -d $tmpdir && !rmdir($tmpdir)) {
+		say 'cannot remove temporary directory [', $tmpdir, ']';
+		$tmpdir = undef;
+	}
+}
+
+sub mymkfifo {
+	foreach my $filename (@_) {
+		mkfifo( $filename, 0600 ) or die "mkfifo $filename failed: $!";
+		push( @tempfiles, $filename );
+	}
+}
+#endregion
+
+#region signal handling
+$SIG{INT} = $SIG{TERM} = sub {
+	return if $shutting_down;
+
+	$shutting_down = 1;
+
+	say 'interrupted by signal' if $verbose;
+	
+	my $max_stage = 0;
+	for my $entry (values %children) {
+        $max_stage = $entry->{stage}
+            if $entry->{stage} > $max_stage;
+    }
+
+	say 'max stage = ', $max_stage if $very_verbose;
+	for(my $stage = 0; $stage <= $max_stage; $stage++) {
+		my @remainingPids = wait_for_stage($stage, 'TERM', $child_process_timeout);
+		if (scalar @remainingPids) {
+			@remainingPids = wait_for_stage($stage, 'KILL', 0);
+		}
+	}
+
+	exit 2;
+};
+#endregion
+
+sub getbitrate($filename) {
+	my $bit_rate = backticks( $SOX, '--i', '-B', $filename );
+	if ($bit_rate =~ /^\s*(\d+(?:\.\d+)?)\s*([kM])\s*$/) {
+		$bit_rate = $1;
+		if ($2 eq 'M') {
+			$bit_rate *= 1000;
+		}
+	} 
+	return $bit_rate;
+}
+
+sub check_audio_adjustment($adjustment, $audio_file) {
+	my $combine_volume = 0.5;
+	if ( defined($adjustment) && $adjustment >= 1 ) {
+		$combine_volume *= $adjustment;
+		if ( $combine_volume > 1 ) {
+			# try to make sure a large adjustment wouldn't be overdoing it
+			my $soxstats = backticks( $SOX, $audio_file, '-n', 'stat' );
+			if ( $soxstats =~ /^Volume adjustment:\s+(\d?\.\d+)$/m ) {
+				my $voladjust = $1;
+				if ( $combine_volume > $voladjust ) {
+					# use sox's recommendation
+					$combine_volume = $voladjust;
+				}
+			}
+		}
+	}
+	return $combine_volume;
+}
+
+if ( !-r $COMMENTARY_FILE ) {
+	die "cannot read commentary file $COMMENTARY_FILE";
+}
+
+$tmpdir = backticks( 'mktemp', '--tmpdir=/tmp', '--directory', 'merge_audio.XXXXXXXXXX' );
+say "temporary directory = $tmpdir" if $verbose;
+if ( $? != 0 || $tmpdir eq '' ) {
+	die "cannot create temporary directory: $!";
+}
+
+#
+# get the sample rate of the commentary
+#
+my $commentary_sample_rate = backticks( $SOX, '--i', '-r', $COMMENTARY_FILE );
+if ( $? != 0 || $commentary_sample_rate eq '' ) {
+	die "cannot determine sample rate of commentary file $COMMENTARY_FILE: $? $!";
+}
+say "commentary sample rate = $commentary_sample_rate" if $verbose;
+my $commentary_channel_count = backticks( $SOX, '--i', '-c', $COMMENTARY_FILE );
+if ( $? != 0 || $commentary_channel_count eq '' ) {
+	die "cannot determine channel count of commentary file $COMMENTARY_FILE: $? $!";
+}
+say "commentary channel count = $commentary_channel_count" if $verbose;
+my $combined_sample_rate = $commentary_sample_rate;
+my $combined_bit_rate = getbitrate($COMMENTARY_FILE);
+say "commentary average bit rate = ${combined_bit_rate}k" if $verbose;
+
+#
+# analyze movie
+#
+my $movie_audio_channel_count = -1;
+my $movie_audio_stream = -1;
+my $movie_video_stream = -1;
+my $movie_file_has_subtitles = 0;
+my $movie_fps = -1;
+my @movie_subtitle_streams;
+
+#
+# analyze movie audio
+#
+my $movie_info = backticks(
+    $AVPROBE,
+    '-loglevel', 'quiet',
+    '-hide_banner',
+    '-of', 'default',
+    '-show_streams',
+    '-i',
+    $INPUT_MOVIE_FILE
+);
+if ( $? != 0 || $movie_info eq '' ) {
+    die "cannot analyze movie file $INPUT_MOVIE_FILE: $!";
+}
+my @stream_info = split(m:\[STREAM\]|\[/STREAM\]:, $movie_info);
+foreach (@stream_info) {
+    if (/^codec_type\s*=\s*subtitle$/m) {
+    	if ($_ !~ /^codec_name\s*=\s*unknown$/m) {
+	    	$movie_file_has_subtitles = 1;	    	
+			push(@movie_subtitle_streams, (scalar(@movie_subtitle_streams)) );
+    	}
+    }
+    elsif (/^codec_type\s*=\s*video$/m) {
+    	# only use the first video stream encountered 	
+    	if ($movie_video_stream < 0) {
+    		if (/^index\s*=\s*(\d+)$/m) {
+            	$movie_video_stream = $1;
+            	say "movie file $INPUT_MOVIE_FILE video stream number = $movie_video_stream" if $very_verbose;            	
+            }    		
+	     	if (m,^avg_frame_rate\s*=\s*([\d+/\.]+)$,m) {
+	    		my $fp_value = $1;
+	    		say "raw FPS value = $fp_value" if $very_verbose;
+	    		if ($fp_value =~ m,^(\d+)/(\d+)$,) {
+	    			my $denom = ($2 + 0.0);
+	    			if ($denom > 0.0) {
+	    			     $movie_fps = ($1 + 0.0) / $denom;
+	    			}
+	    		}
+	    		else {
+	    			$movie_fps = $fp_value;
+	    		}
+	    		say "movie file $INPUT_MOVIE_FILE avg FPS = $movie_fps" if $very_verbose;               	    		
+	     	}
+	     }
+    }
+    elsif (/^codec_type\s*=\s*audio$/m) {
+		# only use the first audio stream encountered
+    	if ($movie_audio_stream < 0) {
+			if (/^index\s*=\s*(\d+)$/m) {
+				if ($CONFIG_MOVIE_AUDIO_STREAM >= 0 && $1 ne $CONFIG_MOVIE_AUDIO_STREAM) {
+					next;
+				}
+				$movie_audio_stream = $1;
+				say "movie file $INPUT_MOVIE_FILE audio stream number = $movie_audio_stream" if $verbose;            	
+			}
+    		if (/^channels\s*=\s*(\d+)$/m) {
+				$movie_audio_channel_count = $1;
+				say "movie file $INPUT_MOVIE_FILE audio channel count = $movie_audio_channel_count" if $verbose;
+    		}
+    		if (/^sample_rate\s*=\s*(\d+)$/m) {
+				say "movie file $INPUT_MOVIE_FILE audio sample rate = $1" if $verbose;
+				if ($1 > $combined_sample_rate) {
+					$combined_sample_rate = $1;
+				}
+    		}
+    		if (/^bit_rate\s*=\s*(\d+)$/m) {
+				my $bitrate = $1 / 1000;
+				say "movie file $INPUT_MOVIE_FILE bit rate = ${bitrate}k" if $verbose;
+    		}
+    	} 
+    }
+    
+}
+if ($movie_video_stream < 0) {
+	die "cannot determine video stream number count of video file $INPUT_MOVIE_FILE";
+}
+if ($movie_audio_stream < 0) {
+	die "cannot determine audio stream number count of video file $INPUT_MOVIE_FILE";
+}
+say "movie file $INPUT_MOVIE_FILE has subtitles = $movie_file_has_subtitles" if $verbose;
+
+my $childpid;
+my $raw_movie_audio_file            = "$tmpdir/raw_movie_audio.sox";
+
+push(@tempfiles, $raw_movie_audio_file);
+
+#
+# extract audio from movie
+#
+say "starting audio extraction of $INPUT_MOVIE_FILE" if $verbose;
+$childpid = secure_system(
+	{
+		stdin => '/dev/null',
+        stdout => $raw_movie_audio_file,
+		description => 'Audio extracion from movie file',
+		stage => 0,
+    },
+	$AVCONV,
+	'-nostdin',
+	'-loglevel', 'error',
+	# suppress output
+	'-hide_banner',
+	
+	'-i',
+	$INPUT_MOVIE_FILE,
+	
+	'-map', '0:' . $movie_audio_stream,
+
+	# disable video and subtitles
+	'-vn', '-sn',
+	
+	'-b:a', $combined_bit_rate,
+	# i.e. use the pcm_s32le codec
+	'-f', 'sox',
+	'pipe:1'
+);
+
+#
+# calculate any configured volume adjustments
+#
+my $commentary_combine_volume = check_audio_adjustment($COMMENTARY_VOLUME_ADJUSTMENT, $COMMENTARY_FILE);
+say "commentary volume adjustment value = $commentary_combine_volume" if $verbose;
+
+my $movie_combine_volume = check_audio_adjustment($MOVIE_VOLUME_ADJUSTMENT, $raw_movie_audio_file);
+say "movie volume adjustment value = $movie_combine_volume" if $verbose;
+
+#
+# create FIFOs to chain the various subprocesses together
+#
+my $processed_commentary_audio_file = "$tmpdir/processed_commentary_audio.sox";
+my $processed_movie_audio_file      = "$tmpdir/processed_movie_audio.sox";
+my $combined_audio_file             = "$tmpdir/combined_audio.sox";
+
+mymkfifo( $processed_movie_audio_file, $processed_commentary_audio_file, $combined_audio_file );
+
+#
+# movie audio processing (downmixing/dynamic range compression/etc)
+#
+say "starting processing of audio from $INPUT_MOVIE_FILE" if $verbose;
+my @remix_options;
+my @compand_options;
+if ($movie_audio_channel_count == 1) {
+	@remix_options = (
+			'channels',
+			'2',
+	);
+}
+elsif ($movie_audio_channel_count >= 2) {
+
+ 	@compand_options = (
+         'compand',
+         '0.3,1',
+         '5:-80,-79,-38',
+         '-7',
+         '-90',
+         '0.2',
+    );
+	if ($movie_audio_channel_count > 2) {
+		@remix_options = (
+			# downmxing params (from http://really.zonky.org/?p=3180)
+			'remix',
+			#'-m',
+			'1v0.3694,3v0.2612,4v0.3694',
+			'2v0.3694,3v0.2612,5v0.3694',
+			#'1v0.5,3v0.5',
+			#'2v0.5,3v0.5',
+			'norm',	
+		);
+	}
+}
+
+$childpid = background(
+	{
+		stdin => $raw_movie_audio_file,
+        stdout => $processed_movie_audio_file,
+		description => 'Movie audio processing',
+		stage => 1,
+    },
+	$SOX,
+	'-t', 'sox', '-',
+	#'--no-show-progress',
+	'-r',
+	$combined_sample_rate,
+	'-t', 'sox', '-',
+    
+	# dynamic range compression (from http://forum.doom9.org/showthread.php?p=779165#post779165)
+	# the "Film Standard" settings
+	# compand 0.1,0.3 -90,-90,-70,-64,-43,-37,-31,-31,-21,-21,0,-20 0 -90 0.1
+	#'compand',
+	#'0.1,0.3',
+	#'-90,-90,-70,-64,-43,-37,-31,-31,-21,-21,0,-20',
+	#'0',    # gain in dB
+	#'-90',
+	#'0.1'
+
+	  # the "Film Light" settings
+	  # compand 0.1,0.3 -90,-90,-70,-64,-53,-47,-41,-41,-21,-21,0,-20 0 -90 0.1
+
+
+	# http://forum.doom9.org/archive/index.php/t-163823.html
+	
+	@compand_options,
+
+	# downmixing options (if needed)
+	@remix_options
+);
+
+#
+# commentary trimming
+#
+say "starting commentary processing" if $verbose;
+my @commentary_processing_opts;
+if ($COMMENTARY_OFFSET ne '') {
+	@commentary_processing_opts = (
+		'trim', $COMMENTARY_OFFSET,
+	);
+}
+elsif ($COMMENTARY_PADDING ne '') {
+	@commentary_processing_opts = (
+		'pad', $COMMENTARY_PADDING,
+	);
+}
+$childpid = background(
+	{
+        stdout => $processed_commentary_audio_file,
+		description => 'Commentary audio processing',
+		stage => 0,
+    },
+	$SOX,
+	$COMMENTARY_FILE,
+	'-c', '2',
+	'-r', $combined_sample_rate,
+	'-t', 'sox', '-',
+	@commentary_processing_opts
+);
+
+#
+# audio combination
+#
+if ($ducking) {
+	# TODO make these configurable
+	my $duck_threshold = 0.03;
+	my $duck_ratio = 20;
+	my $duck_attack_ms = 20;
+	my $duck_release_ms = 500;
+	my $duck_lookahead_ms = 500;
+	my $filter_complex;
+	if ($duck_lookahead_ms > 0) {
+		 $filter_complex = 
+		 '[0:a]volume=' . $commentary_combine_volume
+		. ',asplit=2[commentary][sc];'
+
+		. '[1:a]volume=' . $movie_combine_volume
+		. ',adelay=' . $duck_lookahead_ms . ':all=1[delayed_movie];'
+
+		. '[delayed_movie][sc]sidechaincompress='
+		.     'threshold=' . $duck_threshold . ':'
+		.     'ratio='     . $duck_ratio . ':'
+		.     'attack='    . $duck_attack_ms . ':'
+		.     'release='   . $duck_release_ms
+		. '[delayed_ducked];'
+
+		. '[delayed_ducked]'
+		. 'atrim=start=' . ($duck_lookahead_ms / 1000)
+		. ',asetpts=PTS-STARTPTS[ducked_movie];'
+
+		. '[ducked_movie][commentary]'
+		. 'amix=inputs=2:duration=first:normalize=0[mixed]';
+	}
+	else {
+		 $filter_complex = 
+			'[0:a]volume=' . $commentary_combine_volume . ',asplit=2[commentary][sc];' .
+
+			'[1:a]volume=' . $movie_combine_volume . '[movie];' .
+
+			'[movie][sc]sidechaincompress=' .
+				'threshold=0.03:' .
+				'ratio=20:' .
+				'attack=20:' .
+				'release=500' .
+			'[ducked];' .
+
+			'[ducked][commentary]amix=' .
+				'inputs=2:' .
+				'normalize=0' .
+				'[mixed]';
+	}
+
+	$childpid = background(
+		{
+			stdout => $combined_audio_file,
+			description => 'Audio combination',
+			stage => 2,
+		},
+		$AVCONV,
+		'-nostdin',
+		'-loglevel', 'warning',
+		'-hide_banner',
+
+		'-i', $processed_commentary_audio_file,
+		'-i', $processed_movie_audio_file,
+
+		'-filter_complex',
+		$filter_complex,
+
+		'-map', '[mixed]',
+		'-c:a', 'pcm_s32le',
+		'-f', 'sox',
+		'pipe:1',
+	);
+}
+else {
+	# old SOX based autio combination command
+	$childpid = background(
+		{
+			stdout => $combined_audio_file,
+			description => 'Audio combination',
+			stage => 2,
+		},
+		$SOX,
+		'--volume',  $commentary_combine_volume, $processed_commentary_audio_file,
+		'--volume',  $movie_combine_volume,      $processed_movie_audio_file,
+		'--combine', 'mix',
+		'-t', 'sox', '-'
+	);
+}
+
+#
+# combine processed audio and original video into a new file
+#
+say "starting movie audio replacement" if $verbose;
+my @command = (
+	$AVCONV,
+	'-loglevel', 'quiet',
+	'-threads', '0',
+	'-thread_queue_size', '65536',
+	'-i', $INPUT_MOVIE_FILE,
+	'-thread_queue_size', '262144',
+	'-f', 'sox',
+	'-i', 'pipe:',
+
+	'-map', '0:v:' . $movie_video_stream,
+	'-map', '1:a',
+	'-metadata:s:a:0', 'language=eng',
+	'-hide_banner',
+
+	'-c:v', 'copy',
+
+	'-c:a', 'aac', '-b:a', $combined_bit_rate . 'k', #'-profile:a', 'aac_main',
+	'-strict', '-2',
+);
+if (defined($metadata)) {
+	while (my ($key, $value) = each(%$metadata) ) {	
+		if ($key ne 'artwork') {
+			if ($key eq 'commentary') {
+				push(@command, '-metadata:s:a:0');
+				push(@command, 'title=' . $value);
+			}
+			else {
+				push(@command, '-metadata');
+				# don't need quotes as the command is not being run through a shell
+				push(@command, $key . '=' . $value);
+	            if ($key eq 'year') {
+	                push(@command, '-metadata');
+	                push(@command, 'date=' . $value);
+	            }
+			}
+		}
+	}
+}
+else {
+	push(@command, '-map_metadata:g', '0:g');
+}
+
+if ($copy_subtitles && $movie_file_has_subtitles) {
+	say "copying subtitles streams ", join(', ', @movie_subtitle_streams) if $verbose;
+	push(@command, '-c:s');
+	push(@command, 'copy');
+	foreach my $streamid (@movie_subtitle_streams) {    
+		push(@command, '-map');
+		push(@command, '0:s:' . $streamid);
+	}
+}
+else {
+	push(@command, '-sn');
+}
+push(@command, '-y');
+push(@command, $OUTPUT_MOVIE_FILE);
+$childpid = background(
+    {
+        stdin => $combined_audio_file,
+		description => 'Audio replacement in movie file',
+		stage => 3,
+    },	
+	@command,
+);
+say 'movie audio replacement command: ', join(' ', @command) if $verbose;
+
+if ($very_verbose) {
+	say Dumper(\%children);
+}
+
+#
+# block waiting for children to exit
+#
+say "waiting for children to finish..." if $verbose;
+while ( scalar( keys %children ) ) {
+	my $pid = waitpid(-1, 0);
+
+	if ( $pid == -1 ) {
+        die "waitpid failed: $!"
+            unless $!{ECHILD};
+    }
+
+	last if $pid == -1;     # no more children
+	my $status = $?;
+
+   	my $description = $children{$pid}{description};
+	delete $children{$pid};
+
+	if ( $status == 0 ) {
+        say "$description completed successfully" if $verbose;
+    }
+}
+
+# apply artwork to the output video file
+if (defined $artwork_file && length $artwork_file) {
+    backticks($ATOMICPARSLEY, $OUTPUT_MOVIE_FILE, '--artwork', 'REMOVE_ALL', '--artwork', $artwork_file, '--overWrite');
+}
+
+say 'elapsed time = ', ( time - $starttime ), " seconds";
+
+END {
+	cleanup_temp_files();
+}
