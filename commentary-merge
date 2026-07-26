@@ -729,7 +729,9 @@ $childpid = background(
 # audio combination
 #
 if ($ducking) {
+	#
 	# TODO make these configurable
+	#
 	my $duck_threshold = 0.03;
 	my $duck_ratio = 20;
 	my $duck_attack_ms = 20;
@@ -738,25 +740,25 @@ if ($ducking) {
 	my $filter_complex;
 	if ($duck_lookahead_ms > 0) {
 		 $filter_complex = 
-		 '[0:a]volume=' . $commentary_combine_volume
-		. ',asplit=2[commentary][sc];'
+			'[0:a]volume=' . $commentary_combine_volume .
+				',asplit=2[commentary][sc];' .
 
-		. '[1:a]volume=' . $movie_combine_volume
-		. ',adelay=' . $duck_lookahead_ms . ':all=1[delayed_movie];'
+			'[1:a]volume=' . $movie_combine_volume . 
+				',adelay=' . $duck_lookahead_ms . ':all=1[delayed_movie];' .
 
-		. '[delayed_movie][sc]sidechaincompress='
-		.     'threshold=' . $duck_threshold . ':'
-		.     'ratio='     . $duck_ratio . ':'
-		.     'attack='    . $duck_attack_ms . ':'
-		.     'release='   . $duck_release_ms
-		. '[delayed_ducked];'
+			'[delayed_movie][sc]sidechaincompress=' .
+				'threshold=' . $duck_threshold . ':' .
+				'ratio='     . $duck_ratio . ':' .
+				'attack='    . $duck_attack_ms . ':' .
+				'release='   . $duck_release_ms .
+				'[delayed_ducked];' .
 
-		. '[delayed_ducked]'
-		. 'atrim=start=' . ($duck_lookahead_ms / 1000)
-		. ',asetpts=PTS-STARTPTS[ducked_movie];'
+			'[delayed_ducked]' .
+				'atrim=start=' . ($duck_lookahead_ms / 1000) . 
+				',asetpts=PTS-STARTPTS[ducked_movie];' .
 
-		. '[ducked_movie][commentary]'
-		. 'amix=inputs=2:duration=first:normalize=0[mixed]';
+			'[ducked_movie][commentary]' .
+				'amix=inputs=2:duration=first:normalize=0[mixed]';
 	}
 	else {
 		 $filter_complex = 
@@ -765,11 +767,11 @@ if ($ducking) {
 			'[1:a]volume=' . $movie_combine_volume . '[movie];' .
 
 			'[movie][sc]sidechaincompress=' .
-				'threshold=0.03:' .
-				'ratio=20:' .
-				'attack=20:' .
-				'release=500' .
-			'[ducked];' .
+				'threshold=' . $duck_threshold . ':' .
+				'ratio=' . $duck_ratio . ':' .
+				'attack='    . $duck_attack_ms . ':' .
+				'release='   . $duck_release_ms .
+				'[ducked];' .
 
 			'[ducked][commentary]amix=' .
 				'inputs=2:' .
